@@ -1,0 +1,777 @@
+#include <Arduino.h>
+#include <FastLED.h>
+#include <LEDMatrix.h>
+#include <LEDText.h>
+#include <FontMatrise.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "time.h"
+#include "joystickLib.h"
+#include <DHT.h>
+
+// Task-Handles
+TaskHandle_t SnakeGameTaskHandle = NULL;
+TaskHandle_t TaskBHandle = NULL;
+TaskHandle_t TaskCHandle = NULL;
+TaskHandle_t DHTTaskHandle = NULL;
+TaskHandle_t MenuTaskHandle = NULL;
+
+// Taster-Objekt (Pins: 32, 34, 35)
+EntprellterTaster taster(32, 34, 35);
+
+// DHT22 Sensor Setup
+#define DHTPIN 21
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// Aktuelle Task-Nummer
+volatile int aktuelleTaskNummer = 0;
+
+// WLAN-Zugangsdaten
+const char* ssid = "FITZ!Box 7590 HN";
+const char* password = "fitzinger";
+
+// NTP-Server für Uhrzeitanzeige (Task C)
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 3600; // GMT+1
+const int daylightOffset_sec = 3600; // Sommerzeit
+
+// OpenWeatherMap-API-Details für Wetteranzeige (Task B)
+const char* weatherApiKey = "965631ef20117397bfee0d02ee665406";
+const char* city = "Innsbruck";
+const char* weatherApiUrl = "http://api.openweathermap.org/data/2.5/weather?q=Innsbruck&appid=";
+
+// Webhook-URL für DHTTask
+const char* webhookUrl = "https://script.google.com/macros/s/AKfycbyH1J5bwt9Jv1lmUOqEWj-NJBnUZ2gF7XvtkgZbwpSiixqovzjH4-XWufLUBbi6iHk/exec";
+
+// Matrix Definitionen
+#define LED_PIN_UPPER   25  // Oberes Panel
+#define LED_PIN_LOWER   26  // Unteres Panel
+#define COLOR_ORDER     GRB
+#define CHIPSET         WS2812B
+
+#define MATRIX_WIDTH    32
+#define MATRIX_HEIGHT   8
+#define MATRIX_TYPE     VERTICAL_ZIGZAG_MATRIX
+
+// Zwei separate LED-Matrizen definieren
+cLEDMatrix<MATRIX_WIDTH, -MATRIX_HEIGHT, MATRIX_TYPE> upperMatrix;
+cLEDMatrix<-MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_TYPE> lowerMatrix;
+
+// Zwei separate Scrolling-Textobjekte
+cLEDText upperScrollingMsg;
+cLEDText lowerScrollingMsg;
+
+// Buffer für die anzuzeigenden Texte
+unsigned char upperTextBuffer[75]; 
+unsigned char lowerTextBuffer[75]; 
+int upperTextLength = 0;
+int lowerTextLength = 0;
+
+// Timer für verschiedene Aktualisierungsintervalle
+unsigned long lastWeatherUpdate = 0;
+unsigned long lastTimeUpdate = 0;
+unsigned long lastScrollUpdate = 0;
+unsigned long lastSensorRead = 0;
+const unsigned long weatherUpdateInterval = 60000; // Wetterupdate alle 60 Sekunden
+const unsigned long timeUpdateInterval = 1000;     // Zeitupdate jede Sekunde
+const unsigned long scrollUpdateInterval = 100;    // Basis-Scrolling-Intervall
+const unsigned long sensorReadInterval = 5000;     // Sensor alle 5 Sekunden auslesen
+
+// Variable zum Speichern der Wetterdaten (Task B)
+float temperature = 0.0;
+String weatherDescription = "";
+
+// Variable zum Verfolgen der Scrollposition
+int upperScrollCount = 0;
+int lowerScrollCount = 0;
+int upperTextWidth = 0;
+int lowerTextWidth = 0;
+bool textNeedsUpdate = false;
+bool upperScrollCompleted = false;
+bool lowerScrollCompleted = false;
+
+// Sensor-Status Variablen für nicht-blockierendes Lesen (DHTTask)
+bool sensorReadRequested = false;
+unsigned long sensorRequestTime = 0;
+const unsigned long sensorReadDelay = 10; // Minimale Wartezeit zwischen Anfrage und Lesen
+
+// Semaphore für den Zugriff auf die LED-Matrix
+SemaphoreHandle_t ledMatrixSemaphore = NULL;
+
+// ====================== SNAKE GAME VARIABLEN ======================
+#define SNAKE_BRIGHTNESS  50
+#define SNAKE_DEADZONE    600
+#define SNAKE_BORDER_SIZE 1
+
+struct Point {
+  int x;
+  int y;
+};
+
+Point snake[512];
+int snakeLength = 3;
+int dirX = 1;
+int dirY = 0;
+Point food;
+
+unsigned long lastMoveTime = 0;
+unsigned long moveInterval = 200;
+unsigned long respawnTime = 0;
+bool gameOver = false;
+unsigned long respawnDelay = 1000;
+
+// ====================== FUNKTIONEN ======================
+
+// Aktualisierung der Scroll-Position für beide Panels
+void updateScrollText() {
+  // Update oberes Panel
+  upperScrollingMsg.UpdateText();
+  upperScrollCount++;
+
+  // Update unteres Panel
+  lowerScrollingMsg.UpdateText();
+  lowerScrollCount++;
+
+  // Unterschiedliche Scroll-Reset-Grenzen je nach aktivem Task
+  int upperResetLimit;
+  int lowerResetLimit;
+
+  switch (aktuelleTaskNummer) {
+    case 1: // Task B (Wetter)
+      upperResetLimit = upperTextWidth + MATRIX_WIDTH - 45;
+      lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
+      break;
+    case 2: // Task C (Uhrzeit)
+      upperResetLimit = upperTextWidth + MATRIX_WIDTH-32;
+      lowerResetLimit = lowerTextWidth + MATRIX_WIDTH-30;
+      break;
+    case 3: // DHTTask
+      upperResetLimit = 0; // Wird nicht verwendet
+      lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
+      break;
+    default: // Snake Game
+      return; // Kein Scrolling für Snake Game
+  }
+
+  // Scroll-Reset nur wenn der gesamte Text durchgelaufen ist
+  if (aktuelleTaskNummer != 3 && upperScrollCount >= upperResetLimit) {
+    upperScrollCount = 0;
+    upperScrollCompleted = true;
+    upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+  }
+
+  if (lowerScrollCount >= lowerResetLimit) {
+    lowerScrollCount = 0;
+    lowerScrollCompleted = true;
+    lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+  }
+}
+
+// ================= TASK B: WETTER-FUNKTIONEN =================
+
+void updateWeather() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String(weatherApiUrl) + weatherApiKey;
+    http.begin(url);
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode == 200) {
+      String payload = http.getString();
+      Serial.println("Wetterdaten empfangen:");
+      parseWeather(payload);
+    } else {
+      Serial.printf("Fehler beim Abrufen der Wetterdaten: HTTP %d\n", httpResponseCode);
+    }
+    http.end();
+  } else {
+    Serial.println("Nicht mit dem WLAN verbunden.");
+  }
+}
+
+void parseWeather(const String& json) {
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, json);
+
+  if (error) {
+    Serial.println("Fehler beim Parsen der JSON-Daten.");
+    return;
+  }
+
+  // Wetterbeschreibung auslesen
+  weatherDescription = doc["weather"][0]["description"].as<String>();
+
+  // Temperatur als float auslesen
+  temperature = doc["main"]["temp"].as<float>() - 273.15; // Kelvin in Celsius umrechnen
+
+  // Ausgabe im Serial Monitor
+  Serial.printf("Wetter: %s\n", weatherDescription.c_str());
+  Serial.printf("Temperatur: %.2f °C\n", temperature);
+  
+  // Markiere, dass wir ein Update des Textes benötigen
+  textNeedsUpdate = true;
+}
+
+void updateDisplayWithWeather() {
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    // Text für oberes Panel (Temperatur) formatieren
+    char tempText[75];
+    sprintf(tempText, "      %.1f°C", temperature);
+    
+    // Text für unteres Panel (Wetter) formatieren
+    char weatherText[75];
+    sprintf(weatherText, "      %s", weatherDescription.c_str());
+    
+    // Texte für LED-Matrizen setzen
+    strcpy((char*)upperTextBuffer, tempText);
+    strcpy((char*)lowerTextBuffer, weatherText);
+    upperTextLength = strlen((char*)upperTextBuffer);
+    lowerTextLength = strlen((char*)lowerTextBuffer);
+    
+    // Berechne die ungefähre Breite der Texte
+    upperTextWidth = upperTextLength * 6;
+    lowerTextWidth = lowerTextLength * 6;
+    
+    // Setze neuen Text nur, wenn der vorherige Text vollständig gescrollt wurde
+    // oder wenn wir gerade das erste Update durchführen
+    if (upperScrollCompleted || upperScrollCount == 0) {
+      upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+      upperScrollCount = 0;
+      upperScrollCompleted = false;
+    }
+    
+    if (lowerScrollCompleted || lowerScrollCount == 0) {
+      lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+      lowerScrollCount = 0;
+      lowerScrollCompleted = false;
+    }
+    
+    xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
+// ================= TASK C: UHRZEIT-FUNKTIONEN =================
+
+void updateTimeDisplay() {
+  struct tm timeInfo;
+  if (getLocalTime(&timeInfo)) {
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      // Text für oberes Panel (Uhrzeit) formatieren
+      char timeText[75];
+      sprintf(timeText, "      %02d:%02d:%02d", 
+              timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+      
+      // Text für unteres Panel (Datum) formatieren
+      char dateText[75];
+      sprintf(dateText, "      %02d.%02d.%04d",
+              timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
+      
+      // Texte für LED-Matrizen setzen
+      strcpy((char*)upperTextBuffer, timeText);
+      strcpy((char*)lowerTextBuffer, dateText);
+      upperTextLength = strlen((char*)upperTextBuffer);
+      lowerTextLength = strlen((char*)lowerTextBuffer);
+      
+      // Berechne die ungefähre Breite der Texte
+      upperTextWidth = upperTextLength * 6;
+      lowerTextWidth = lowerTextLength * 6;
+      
+      // Setze neuen Text nur, wenn der vorherige Text vollständig gescrollt wurde
+      // oder wenn wir gerade das erste Update durchführen
+      if (upperScrollCompleted || upperScrollCount == 0) {
+        upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+        upperScrollCount = 0;
+        upperScrollCompleted = false;
+      }
+      
+      if (lowerScrollCompleted || lowerScrollCount == 0) {
+        lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+        lowerScrollCount = 0;
+        lowerScrollCompleted = false;
+      }
+      
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
+  } else {
+    Serial.println("Fehler beim Abrufen der Zeit");
+  }
+}
+
+// ================= DHT TASK FUNKTIONEN =================
+
+void sendeDaten(float temperatur) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String(webhookUrl) + "?temperatur=" + temperatur;
+    
+    http.begin(url);
+    int httpResponseCode = http.GET();
+    
+    if (httpResponseCode == 200) {
+      Serial.println("Daten erfolgreich gesendet");
+    } else {
+      Serial.printf("Fehler beim Senden: HTTP %d\n", httpResponseCode);
+    }
+    http.end();
+  } else {
+    Serial.println("Keine WLAN-Verbindung.");
+  }
+}
+
+void updateSensorDisplay() {
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    // Oberes Panel leer lassen
+    FastLED.clear();
+    
+    // Text für unteres Panel formatieren
+    char sensorText[75];
+    sprintf(sensorText, "      Temperatur wird gemessen");
+    
+    // Text für LED-Matrix setzen
+    strcpy((char*)lowerTextBuffer, sensorText);
+    lowerTextLength = strlen((char*)lowerTextBuffer);
+    
+    // Berechne die ungefähre Breite des Textes
+    lowerTextWidth = lowerTextLength * 6;
+    
+    // Setze neuen Text
+    if (lowerScrollCompleted || lowerScrollCount == 0) {
+      lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+      lowerScrollCount = 0;
+      lowerScrollCompleted = false;
+    }
+    
+    xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
+// ================= SNAKE GAME FUNKTIONEN =================
+
+bool isOnBorder(int x, int y) {
+  return (x < SNAKE_BORDER_SIZE || x >= MATRIX_WIDTH - SNAKE_BORDER_SIZE || 
+          y < SNAKE_BORDER_SIZE || y >= MATRIX_HEIGHT * 2 - SNAKE_BORDER_SIZE);
+}
+
+void readJoystick() {
+  int x = taster.leseY() - 2048;  // X-Bewegung vom Y-Pin des Joysticks
+  int y = taster.leseX() - 2048;  // Y-Bewegung vom X-Pin des Joysticks
+  
+  if (abs(x) > abs(y)) {
+    if (x > SNAKE_DEADZONE && dirX != -1) { dirX = 1; dirY = 0; }
+    else if (x < -SNAKE_DEADZONE && dirX != 1) { dirX = -1; dirY = 0; }
+  } else {
+    // Y-Richtung für die korrekte Steuerung anpassen
+    if (y > SNAKE_DEADZONE && dirY != 1) { dirX = 0; dirY = -1; }  // Nach oben -> dirY = -1
+    else if (y < -SNAKE_DEADZONE && dirY != -1) { dirX = 0; dirY = 1; }  // Nach unten -> dirY = 1
+  }
+}
+
+void moveSnake() {
+  // Prüfen, ob der nächste Schritt in die Wand führen würde
+  int nextX = snake[0].x + dirX;
+  int nextY = snake[0].y + dirY;
+  
+  // Wenn der nächste Schritt auf den Rand führt, Game Over
+  if (isOnBorder(nextX, nextY)) {
+    gameOver = true;
+    respawnTime = millis();
+    return;
+  }
+  
+  // Schlange bewegen (nur wenn kein Game Over)
+  for (int i = snakeLength - 1; i > 0; i--) {
+    snake[i] = snake[i - 1];
+  }
+  
+  snake[0].x = nextX;
+  snake[0].y = nextY;
+  
+  if (snake[0].x == food.x && snake[0].y == food.y) {
+    if (snakeLength < 511) snakeLength++;
+    spawnFood();
+  }
+}
+
+void checkCollision() {
+  // Kollision mit sich selbst
+  for (int i = 1; i < snakeLength; i++) {
+    if (snake[0].x == snake[i].x && snake[0].y == snake[i].y) {
+      gameOver = true;
+      respawnTime = millis();
+      return;
+    }
+  }
+}
+
+void spawnFood() {
+  bool valid = false;
+  while (!valid) {
+    food.x = random(SNAKE_BORDER_SIZE + 1, MATRIX_WIDTH - SNAKE_BORDER_SIZE - 1);
+    food.y = random(SNAKE_BORDER_SIZE + 1, MATRIX_HEIGHT * 2 - SNAKE_BORDER_SIZE - 1);
+    
+    valid = true;
+    
+    if (isOnBorder(food.x, food.y)) {
+      valid = false;
+      continue;
+    }
+    
+    for (int i = 0; i < snakeLength; i++) {
+      if (snake[i].x == food.x && snake[i].y == food.y) {
+        valid = false;
+        break;
+      }
+    }
+  }
+}
+
+void setLED(uint8_t x, uint8_t y, CRGB color) {
+  if (x >= MATRIX_WIDTH || y >= MATRIX_HEIGHT * 2) return;
+  
+  if (y < MATRIX_HEIGHT) {
+    // Oberes Panel - nur bei Snake Game vertikal spiegeln
+    if (aktuelleTaskNummer == 0) { // Snake Game
+      // Nur vertikale Spiegelung für das obere Panel
+      uint8_t rotatedY = MATRIX_HEIGHT - 1 - y;
+      upperMatrix(x, rotatedY) = color;
+    } else {
+      // Normale Darstellung für andere Tasks
+      upperMatrix(x, y) = color;
+    }
+  } else {
+    // Unteres Panel (umgedreht)
+    uint8_t localY = y - MATRIX_HEIGHT;
+    lowerMatrix(x, MATRIX_HEIGHT - 1 - localY) = color;
+  }
+}
+
+void drawSnakeGame() {
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    // Alle LEDs löschen
+    FastLED.clear();
+    
+    // Gelben Rand zeichnen
+    for (int x = 0; x < MATRIX_WIDTH; x++) {
+      for (int y = 0; y < MATRIX_HEIGHT * 2; y++) {
+        if (isOnBorder(x, y)) {
+          setLED(x, y, CRGB::Yellow);
+        }
+      }
+    }
+    
+    // Food zeichnen
+    if (!isOnBorder(food.x, food.y)) {
+      setLED(food.x, food.y, CRGB::Red);
+    }
+    
+    // Snake zeichnen
+    for (int i = 0; i < snakeLength; i++) {
+      if (!isOnBorder(snake[i].x, snake[i].y)) {
+        setLED(snake[i].x, snake[i].y, (i == 0) ? CRGB::Lime : CRGB::Green);
+      }
+    }
+    
+    FastLED.show();
+    xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
+void resetSnakeGame() {
+  // Initialisiere die Schlange in der Mitte des spielbaren Bereichs
+  int centerX = (MATRIX_WIDTH - 2*SNAKE_BORDER_SIZE) / 2 + SNAKE_BORDER_SIZE;
+  int centerY = (MATRIX_HEIGHT * 2 - 2*SNAKE_BORDER_SIZE) / 2 + SNAKE_BORDER_SIZE;
+  
+  snake[0] = {centerX, centerY};
+  snake[1] = {centerX - 1, centerY};
+  snake[2] = {centerX - 2, centerY};
+  snakeLength = 3;
+  dirX = 1;
+  dirY = 0;
+  gameOver = false;
+}
+
+// ================= TASK-DEFINITIONEN =================
+
+// Snake Game Task
+void SnakeGameTask(void *parameter) {
+  resetSnakeGame();
+  randomSeed(analogRead(33));
+  spawnFood();
+  
+  while (1) {
+    if (gameOver) {
+      if (millis() - respawnTime >= respawnDelay) {
+        resetSnakeGame();
+        spawnFood();
+      }
+    } else {
+      readJoystick();
+      
+      if (millis() - lastMoveTime > moveInterval) {
+        lastMoveTime = millis();
+        moveSnake();
+        checkCollision();
+        drawSnakeGame();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// Task B: Zeigt Wetterdaten auf LED-Matrix an
+void TaskB(void *parameter) {
+  FastLED.clear();
+  while (1) {
+    Serial.println("Task B - Wetter");
+    
+    // Wetter aktualisieren
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastWeatherUpdate >= weatherUpdateInterval) {
+      lastWeatherUpdate = currentMillis;
+      updateWeather();
+    }
+    
+    // Wenn ein Update des Textes notwendig ist
+    if (textNeedsUpdate) {
+      updateDisplayWithWeather();
+      textNeedsUpdate = false;
+    }
+    
+    // Text scrollen und anzeigen
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      updateScrollText();
+      FastLED.show();
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// Task C: Zeigt Uhrzeit auf LED-Matrix an 
+void TaskC(void *parameter) {
+  while (1) {
+    Serial.println("Task C - Uhrzeit");
+    
+    // Zeit aktualisieren
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastTimeUpdate >= timeUpdateInterval) {
+      lastTimeUpdate = currentMillis;
+      updateTimeDisplay();
+    }
+    
+    // Text scrollen und anzeigen
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      updateScrollText();
+      FastLED.show();
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// DHTTask: Sensordaten auslesen und senden
+void DHTTask(void *parameter) {
+  // Einmalige Anzeige-Initialisierung für DHTTask
+  updateSensorDisplay();
+  
+  while (1) {
+    unsigned long currentMillis = millis();
+    
+    // Sensor-Leseanfrage starten (nicht-blockierend)
+    if (currentMillis - lastSensorRead >= sensorReadInterval && !sensorReadRequested) {
+      sensorReadRequested = true;
+      sensorRequestTime = currentMillis;
+      Serial.println("DHTTask - Sensor-Anfrage gestartet");
+    }
+    
+    // Sensor-Daten lesen wenn genug Zeit vergangen ist
+    if (sensorReadRequested && (currentMillis - sensorRequestTime >= sensorReadDelay)) {
+      // Temperatur vom DHT22 Sensor lesen
+      float temperatur = dht.readTemperature();
+      
+      if (isnan(temperatur)) {
+        Serial.println("Fehler beim Lesen der Temperatur!");
+      } else {
+        Serial.printf("Temperatur: %.2f °C\n", temperatur);
+        // Sende Daten in separater Task um Blocking zu vermeiden
+        xTaskCreate([](void* param) {
+          float temp = *((float*)param);
+          sendeDaten(temp);
+          vTaskDelete(NULL);
+        }, "SendData", 4096, &temperatur, 1, NULL);
+      }
+      
+      sensorReadRequested = false;
+      lastSensorRead = currentMillis;
+    }
+    
+    // Text scrollen und anzeigen (läuft kontinuierlich)
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      updateScrollText();
+      FastLED.show();
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
+    
+    // Sehr kurze Verzögerung für flüssiges Scrolling
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// Funktion, um zwischen den Tasks zu wechseln
+void wechsleTask() {
+  // Sicherstellen, dass beide Scroll-Zähler zurückgesetzt werden, wenn wir den Task wechseln
+  upperScrollCount = 0;
+  lowerScrollCount = 0;
+  upperScrollCompleted = true;
+  lowerScrollCompleted = true;
+  
+  switch (aktuelleTaskNummer) {
+    case 0:
+      Serial.println("Wechsel zu Task B (Wetter)");
+      vTaskSuspend(SnakeGameTaskHandle);
+      vTaskResume(TaskBHandle);
+      aktuelleTaskNummer = 1;
+      break;
+    case 1:
+      Serial.println("Wechsel zu Task C (Uhrzeit)");
+      vTaskSuspend(TaskBHandle);
+      vTaskResume(TaskCHandle);
+      aktuelleTaskNummer = 2;
+      break;
+    case 2:
+      Serial.println("Wechsel zu DHTTask (Sensor)");
+      vTaskSuspend(TaskCHandle);
+      vTaskResume(DHTTaskHandle);
+      updateSensorDisplay(); // Display für DHTTask neu initialisieren
+      aktuelleTaskNummer = 3;
+      break;
+    case 3:
+      Serial.println("Wechsel zu Snake Game");
+      vTaskSuspend(DHTTaskHandle);
+      vTaskResume(SnakeGameTaskHandle);
+      aktuelleTaskNummer = 0;
+      break;
+  }
+}
+
+// Menü-Task: Überwacht den langen Tastendruck und wechselt die Tasks
+void MenuTask(void *parameter) {
+  while (1) {
+    taster.aktualisiere(); // Taster-Status aktualisieren
+    if (taster.wurdeLangeGedrueckt()) {
+      Serial.println("Langer Tastendruck erkannt. Wechsel zwischen Tasks.");
+      wechsleTask();
+    }
+    vTaskDelay(pdMS_TO_TICKS(10)); // Kurze Verzögerung zur Entlastung des Prozessors
+  }
+}
+
+// ================= SETUP & LOOP =================
+
+void setup() {
+  // Serial-Kommunikation starten
+  Serial.begin(115200);
+  delay(1000); // Kurze Wartezeit für den Serial-Monitor
+  
+  Serial.println("Starte FreeRTOS LED Matrix Projekt mit 4 Tasks...");
+  
+  // DHT Sensor initialisieren
+  dht.begin();
+  
+  // LED Matrix Setup für beide Panels
+  FastLED.addLeds<CHIPSET, LED_PIN_UPPER, COLOR_ORDER>(upperMatrix[0], upperMatrix.Size());
+  FastLED.addLeds<CHIPSET, LED_PIN_LOWER, COLOR_ORDER>(lowerMatrix[0], lowerMatrix.Size());
+  FastLED.setBrightness(10);
+  FastLED.clear(true);
+  
+  // Initialisiere die Laufschrift für das obere Panel
+  upperScrollingMsg.SetFont(MatriseFontData);
+  upperScrollingMsg.Init(&upperMatrix, upperMatrix.Width(), upperScrollingMsg.FontHeight() + 1, 0, 0);
+  upperScrollingMsg.SetScrollDirection(SCROLL_LEFT);
+  upperScrollingMsg.SetTextDirection(SCROLL_LEFT);
+  upperScrollingMsg.SetTextColrOptions(COLR_RGB | COLR_SINGLE, 0x00, 0xff, 0xff);
+  
+  // Initialisiere die Laufschrift für das untere Panel
+  lowerScrollingMsg.SetFont(MatriseFontData);
+  lowerScrollingMsg.Init(&lowerMatrix, lowerMatrix.Width(), lowerScrollingMsg.FontHeight() + 1, 0, 0);
+  lowerScrollingMsg.SetScrollDirection(SCROLL_LEFT);
+  lowerScrollingMsg.SetTextDirection(SCROLL_LEFT);
+  lowerScrollingMsg.SetTextColrOptions(COLR_RGB | COLR_SINGLE, 0xff, 0x80, 0x00);
+  
+  // Starttexte
+  strcpy((char*)upperTextBuffer, "      Verbinde mit WLAN...");
+  strcpy((char*)lowerTextBuffer, "      Verbinde mit WLAN...");
+  upperTextLength = strlen((char*)upperTextBuffer);
+  lowerTextLength = strlen((char*)lowerTextBuffer);
+  upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+  lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+  
+  // Initialisiere die Scroll-Flags
+  upperScrollCompleted = false;
+  lowerScrollCompleted = false;
+  
+  // Semaphore erstellen
+  ledMatrixSemaphore = xSemaphoreCreateMutex();
+  
+  // WLAN verbinden
+  WiFi.begin(ssid, password);
+  Serial.print("Verbinde mit WLAN");
+  int reconnectAttempts = 0;
+  const int maxReconnectAttempts = 20;
+  
+  while (WiFi.status() != WL_CONNECTED && reconnectAttempts < maxReconnectAttempts) {
+    delay(500);
+    Serial.print(".");
+    reconnectAttempts++;
+    
+    // LED-Matrix aktualisieren während wir auf WLAN warten
+    updateScrollText();
+    FastLED.show();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWLAN verbunden!");
+    
+    // Zeit von NTP-Server holen (für Task C)
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    
+    // Ersten Wetterbericht abrufen (für Task B)
+    updateWeather();
+  } else {
+    Serial.println("\nWLAN-Verbindung fehlgeschlagen!");
+  }
+  
+  // Text mit Begrüßung setzen
+  strcpy((char*)upperTextBuffer, "      System bereit!");
+  strcpy((char*)lowerTextBuffer, "      System bereit!");
+  upperTextLength = strlen((char*)upperTextBuffer);
+  lowerTextLength = strlen((char*)lowerTextBuffer);
+  upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+  lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+  
+  // Berechne die ungefähre Breite der Texte
+  upperTextWidth = upperTextLength * 6;
+  lowerTextWidth = lowerTextLength * 6;
+  
+  // Tasks erstellen
+  xTaskCreate(SnakeGameTask, "Snake Game", 4096, NULL, 1, &SnakeGameTaskHandle);
+  xTaskCreate(TaskB, "Task B", 4096, NULL, 1, &TaskBHandle);
+  xTaskCreate(TaskC, "Task C", 4096, NULL, 1, &TaskCHandle);
+  xTaskCreate(DHTTask, "DHT Task", 4096, NULL, 1, &DHTTaskHandle);
+  xTaskCreate(MenuTask, "Menu Task", 2048, NULL, 2, &MenuTaskHandle);
+  
+  // Nur Snake Game soll anfangs laufen, die anderen Tasks pausieren
+  vTaskSuspend(TaskBHandle);
+  vTaskSuspend(TaskCHandle);
+  vTaskSuspend(DHTTaskHandle);
+  
+  Serial.println("System bereit! Snake Game ist aktiv.");
+}
+
+void loop() {
+  // Die loop-Funktion bleibt leer, da alles über FreeRTOS-Tasks gesteuert wird
+}
