@@ -10,7 +10,7 @@
 #include "joystickLib.h"
 #include <DHT.h>
 
-// Task-Handles
+// Task-Handles mit erhöhter Stack-Größe
 TaskHandle_t SnakeGameTaskHandle = NULL;
 TaskHandle_t TaskBHandle = NULL;
 TaskHandle_t TaskCHandle = NULL;
@@ -97,8 +97,14 @@ bool sensorReadRequested = false;
 unsigned long sensorRequestTime = 0;
 const unsigned long sensorReadDelay = 10; // Minimale Wartezeit zwischen Anfrage und Lesen
 
-// Semaphore für den Zugriff auf die LED-Matrix
+// Semaphore für den Zugriff auf die LED-Matrix - KRITISCH für Thread-Sicherheit
 SemaphoreHandle_t ledMatrixSemaphore = NULL;
+
+// Zusätzliche Synchronisation für Task-Wechsel
+SemaphoreHandle_t taskSwitchSemaphore = NULL;
+
+// Flag um sicherzustellen, dass nur eine Task gleichzeitig die LEDs verwendet
+volatile bool ledUpdateInProgress = false;
 
 // ====================== SNAKE GAME VARIABLEN ======================
 #define SNAKE_BRIGHTNESS  50
@@ -122,50 +128,81 @@ unsigned long respawnTime = 0;
 bool gameOver = false;
 unsigned long respawnDelay = 1000;
 
+// ====================== THREAD-SICHERE LED FUNKTIONEN ======================
+
+// Thread-sichere Funktion zum Löschen aller LEDs
+void safeClearLEDs() {
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    ledUpdateInProgress = true;
+    FastLED.clear();
+    ledUpdateInProgress = false;
+    xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
+// Thread-sichere Funktion zum Anzeigen der LEDs
+void safeShowLEDs() {
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    if (!ledUpdateInProgress) {
+      FastLED.show();
+    }
+    xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
 // ====================== FUNKTIONEN ======================
 
-// Aktualisierung der Scroll-Position für beide Panels
+// Aktualisierung der Scroll-Position für beide Panels - THREAD-SICHER
 void updateScrollText() {
-  // Update oberes Panel
-  upperScrollingMsg.UpdateText();
-  upperScrollCount++;
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    ledUpdateInProgress = true;
+    
+    // Update oberes Panel
+    upperScrollingMsg.UpdateText();
+    upperScrollCount++;
 
-  // Update unteres Panel
-  lowerScrollingMsg.UpdateText();
-  lowerScrollCount++;
+    // Update unteres Panel
+    lowerScrollingMsg.UpdateText();
+    lowerScrollCount++;
 
-  // Unterschiedliche Scroll-Reset-Grenzen je nach aktivem Task
-  int upperResetLimit;
-  int lowerResetLimit;
+    // Unterschiedliche Scroll-Reset-Grenzen je nach aktivem Task
+    int upperResetLimit;
+    int lowerResetLimit;
 
-  switch (aktuelleTaskNummer) {
-    case 1: // Task B (Wetter)
-      upperResetLimit = upperTextWidth + MATRIX_WIDTH - 45;
-      lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
-      break;
-    case 2: // Task C (Uhrzeit)
-      upperResetLimit = upperTextWidth + MATRIX_WIDTH-32;
-      lowerResetLimit = lowerTextWidth + MATRIX_WIDTH-30;
-      break;
-    case 3: // DHTTask
-      upperResetLimit = 0; // Wird nicht verwendet
-      lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
-      break;
-    default: // Snake Game
-      return; // Kein Scrolling für Snake Game
-  }
+    switch (aktuelleTaskNummer) {
+      case 1: // Task B (Wetter)
+        upperResetLimit = upperTextWidth + MATRIX_WIDTH - 45;
+        lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
+        break;
+      case 2: // Task C (Uhrzeit)
+        upperResetLimit = upperTextWidth + MATRIX_WIDTH-32;
+        lowerResetLimit = lowerTextWidth + MATRIX_WIDTH-30;
+        break;
+      case 3: // DHTTask
+        upperResetLimit = 0; // Wird nicht verwendet
+        lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
+        break;
+      default: // Snake Game
+        ledUpdateInProgress = false;
+        xSemaphoreGive(ledMatrixSemaphore);
+        return; // Kein Scrolling für Snake Game
+    }
 
-  // Scroll-Reset nur wenn der gesamte Text durchgelaufen ist
-  if (aktuelleTaskNummer != 3 && upperScrollCount >= upperResetLimit) {
-    upperScrollCount = 0;
-    upperScrollCompleted = true;
-    upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
-  }
+    // Scroll-Reset nur wenn der gesamte Text durchgelaufen ist
+    if (aktuelleTaskNummer != 3 && upperScrollCount >= upperResetLimit) {
+      upperScrollCount = 0;
+      upperScrollCompleted = true;
+      upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+    }
 
-  if (lowerScrollCount >= lowerResetLimit) {
-    lowerScrollCount = 0;
-    lowerScrollCompleted = true;
-    lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+    if (lowerScrollCount >= lowerResetLimit) {
+      lowerScrollCount = 0;
+      lowerScrollCompleted = true;
+      lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+    }
+    
+    ledUpdateInProgress = false;
+    xSemaphoreGive(ledMatrixSemaphore);
   }
 }
 
@@ -216,6 +253,8 @@ void parseWeather(const String& json) {
 
 void updateDisplayWithWeather() {
   if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    ledUpdateInProgress = true;
+    
     // Text für oberes Panel (Temperatur) formatieren
     char tempText[75];
     sprintf(tempText, "      %.1f°C", temperature);
@@ -248,6 +287,7 @@ void updateDisplayWithWeather() {
       lowerScrollCompleted = false;
     }
     
+    ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
   }
 }
@@ -258,6 +298,8 @@ void updateTimeDisplay() {
   struct tm timeInfo;
   if (getLocalTime(&timeInfo)) {
     if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      ledUpdateInProgress = true;
+      
       // Text für oberes Panel (Uhrzeit) formatieren
       char timeText[75];
       sprintf(timeText, "      %02d:%02d:%02d", 
@@ -292,6 +334,7 @@ void updateTimeDisplay() {
         lowerScrollCompleted = false;
       }
       
+      ledUpdateInProgress = false;
       xSemaphoreGive(ledMatrixSemaphore);
     }
   } else {
@@ -307,21 +350,63 @@ void sendeDaten(float temperatur) {
     String url = String(webhookUrl) + "?temperatur=" + temperatur;
     
     http.begin(url);
+    
+    // Folge Umleitungen automatisch
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    
+    // Setze User-Agent (manchmal erforderlich für Google Scripts)
+    http.addHeader("User-Agent", "ESP32");
+    
+    // Timeout erhöhen für langsamere Verbindungen
+    http.setTimeout(10000);
+    
     int httpResponseCode = http.GET();
     
     if (httpResponseCode == 200) {
+      String response = http.getString();
       Serial.println("Daten erfolgreich gesendet");
+      Serial.println("Response: " + response);
+    } else if (httpResponseCode == 302) {
+      // Umleitung manuell behandeln
+      String location = http.getLocation();
+      Serial.println("Umleitung zu: " + location);
+      
+      http.end();
+      
+      // Neue Anfrage an umgeleitete URL
+      if (location.length() > 0) {
+        http.begin(location);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.addHeader("User-Agent", "ESP32");
+        
+        int newResponseCode = http.GET();
+        if (newResponseCode == 200) {
+          Serial.println("Daten nach Umleitung erfolgreich gesendet");
+          String response = http.getString();
+          Serial.println("Response: " + response);
+        } else {
+          Serial.printf("Fehler nach Umleitung: HTTP %d\n", newResponseCode);
+        }
+      }
     } else {
       Serial.printf("Fehler beim Senden: HTTP %d\n", httpResponseCode);
+      
+      // Zusätzliche Debugging-Informationen
+      if (httpResponseCode < 0) {
+        Serial.println("Verbindungsfehler - prüfe WLAN und URL");
+      }
     }
+    
     http.end();
   } else {
-    Serial.println("Keine WLAN-Verbindung.");
+    Serial.println("Keine WLAN-Verbindung für Datenübertragung.");
   }
 }
 
 void updateSensorDisplay() {
   if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    ledUpdateInProgress = true;
+    
     // Oberes Panel leer lassen
     FastLED.clear();
     
@@ -343,6 +428,7 @@ void updateSensorDisplay() {
       lowerScrollCompleted = false;
     }
     
+    ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
   }
 }
@@ -449,6 +535,8 @@ void setLED(uint8_t x, uint8_t y, CRGB color) {
 
 void drawSnakeGame() {
   if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    ledUpdateInProgress = true;
+    
     // Alle LEDs löschen
     FastLED.clear();
     
@@ -473,6 +561,7 @@ void drawSnakeGame() {
       }
     }
     
+    ledUpdateInProgress = false;
     FastLED.show();
     xSemaphoreGive(ledMatrixSemaphore);
   }
@@ -501,6 +590,12 @@ void SnakeGameTask(void *parameter) {
   spawnFood();
   
   while (1) {
+    // Prüfe ob diese Task noch aktiv sein soll
+    if (aktuelleTaskNummer != 0) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    
     if (gameOver) {
       if (millis() - respawnTime >= respawnDelay) {
         resetSnakeGame();
@@ -522,29 +617,31 @@ void SnakeGameTask(void *parameter) {
 
 // Task B: Zeigt Wetterdaten auf LED-Matrix an
 void TaskB(void *parameter) {
-  FastLED.clear();
   while (1) {
+    // Prüfe ob diese Task noch aktiv sein soll
+    if (aktuelleTaskNummer != 1) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    
     Serial.println("Task B - Wetter");
     
     // Wetter aktualisieren
     unsigned long currentMillis = millis();
-    if (currentMillis - lastWeatherUpdate >= weatherUpdateInterval) {
+    if (currentMillis - lastWeatherUpdate >= weatherUpdateInterval || lastWeatherUpdate == 0) {
       lastWeatherUpdate = currentMillis;
       updateWeather();
     }
     
-    // Wenn ein Update des Textes notwendig ist
-    if (textNeedsUpdate) {
+    // Wenn ein Update des Textes notwendig ist oder beim ersten Aufruf
+    if (textNeedsUpdate || (upperTextLength == 0 && lowerTextLength == 0)) {
       updateDisplayWithWeather();
       textNeedsUpdate = false;
     }
     
     // Text scrollen und anzeigen
-    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
-      updateScrollText();
-      FastLED.show();
-      xSemaphoreGive(ledMatrixSemaphore);
-    }
+    updateScrollText();
+    safeShowLEDs();
     
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -553,21 +650,24 @@ void TaskB(void *parameter) {
 // Task C: Zeigt Uhrzeit auf LED-Matrix an 
 void TaskC(void *parameter) {
   while (1) {
+    // Prüfe ob diese Task noch aktiv sein soll
+    if (aktuelleTaskNummer != 2) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    
     Serial.println("Task C - Uhrzeit");
     
-    // Zeit aktualisieren
+    // Zeit aktualisieren - beim ersten Aufruf oder nach Intervall
     unsigned long currentMillis = millis();
-    if (currentMillis - lastTimeUpdate >= timeUpdateInterval) {
+    if (currentMillis - lastTimeUpdate >= timeUpdateInterval || lastTimeUpdate == 0) {
       lastTimeUpdate = currentMillis;
       updateTimeDisplay();
     }
     
     // Text scrollen und anzeigen
-    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
-      updateScrollText();
-      FastLED.show();
-      xSemaphoreGive(ledMatrixSemaphore);
-    }
+    updateScrollText();
+    safeShowLEDs();
     
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -579,6 +679,12 @@ void DHTTask(void *parameter) {
   updateSensorDisplay();
   
   while (1) {
+    // Prüfe ob diese Task noch aktiv sein soll
+    if (aktuelleTaskNummer != 3) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    
     unsigned long currentMillis = millis();
     
     // Sensor-Leseanfrage starten (nicht-blockierend)
@@ -602,7 +708,7 @@ void DHTTask(void *parameter) {
           float temp = *((float*)param);
           sendeDaten(temp);
           vTaskDelete(NULL);
-        }, "SendData", 4096, &temperatur, 1, NULL);
+        }, "SendData", 8192, &temperatur, 1, NULL);
       }
       
       sensorReadRequested = false;
@@ -610,51 +716,79 @@ void DHTTask(void *parameter) {
     }
     
     // Text scrollen und anzeigen (läuft kontinuierlich)
-    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
-      updateScrollText();
-      FastLED.show();
-      xSemaphoreGive(ledMatrixSemaphore);
-    }
+    updateScrollText();
+    safeShowLEDs();
     
     // Sehr kurze Verzögerung für flüssiges Scrolling
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-// Funktion, um zwischen den Tasks zu wechseln
+// Funktion, um zwischen den Tasks zu wechseln - THREAD-SICHER
+// Funktion, um zwischen den Tasks zu wechseln - THREAD-SICHER
 void wechsleTask() {
-  // Sicherstellen, dass beide Scroll-Zähler zurückgesetzt werden, wenn wir den Task wechseln
-  upperScrollCount = 0;
-  lowerScrollCount = 0;
-  upperScrollCompleted = true;
-  lowerScrollCompleted = true;
-  
-  switch (aktuelleTaskNummer) {
-    case 0:
-      Serial.println("Wechsel zu Task B (Wetter)");
-      vTaskSuspend(SnakeGameTaskHandle);
-      vTaskResume(TaskBHandle);
-      aktuelleTaskNummer = 1;
-      break;
-    case 1:
-      Serial.println("Wechsel zu Task C (Uhrzeit)");
-      vTaskSuspend(TaskBHandle);
-      vTaskResume(TaskCHandle);
-      aktuelleTaskNummer = 2;
-      break;
-    case 2:
-      Serial.println("Wechsel zu DHTTask (Sensor)");
-      vTaskSuspend(TaskCHandle);
-      vTaskResume(DHTTaskHandle);
-      updateSensorDisplay(); // Display für DHTTask neu initialisieren
-      aktuelleTaskNummer = 3;
-      break;
-    case 3:
-      Serial.println("Wechsel zu Snake Game");
-      vTaskSuspend(DHTTaskHandle);
-      vTaskResume(SnakeGameTaskHandle);
-      aktuelleTaskNummer = 0;
-      break;
+  if (xSemaphoreTake(taskSwitchSemaphore, portMAX_DELAY) == pdTRUE) {
+    // LEDs komplett löschen und Text-Buffer zurücksetzen
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      ledUpdateInProgress = true;
+      
+      // Alle LEDs löschen
+      FastLED.clear();
+      
+      // Text-Buffer komplett löschen
+      memset(upperTextBuffer, 0, sizeof(upperTextBuffer));
+      memset(lowerTextBuffer, 0, sizeof(lowerTextBuffer));
+      upperTextLength = 0;
+      lowerTextLength = 0;
+      
+      // Scroll-Zähler zurücksetzen
+      upperScrollCount = 0;
+      lowerScrollCount = 0;
+      upperScrollCompleted = true;
+      lowerScrollCompleted = true;
+      
+      // Text-Objekte zurücksetzen
+      upperScrollingMsg.SetText((unsigned char*)"", 0);
+      lowerScrollingMsg.SetText((unsigned char*)"", 0);
+      
+      FastLED.show(); // Sofort anzeigen (alles schwarz)
+      
+      ledUpdateInProgress = false;
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
+    
+    // Task wechseln
+    switch (aktuelleTaskNummer) {
+      case 0:
+        Serial.println("Wechsel zu Task B (Wetter)");
+        aktuelleTaskNummer = 1;
+        // Sofortiges Update für Task B erzwingen
+        textNeedsUpdate = true;
+        lastWeatherUpdate = 0; // Erzwinge sofortiges Wetter-Update
+        break;
+      case 1:
+        Serial.println("Wechsel zu Task C (Uhrzeit)");
+        aktuelleTaskNummer = 2;
+        // Sofortiges Update für Task C erzwingen
+        lastTimeUpdate = 0; // Erzwinge sofortiges Zeit-Update
+        break;
+      case 2:
+        Serial.println("Wechsel zu DHTTask (Sensor)");
+        aktuelleTaskNummer = 3;
+        // Display für DHTTask explizit neu initialisieren
+        vTaskDelay(pdMS_TO_TICKS(100)); // Kurz warten
+        updateSensorDisplay();
+        break;
+      case 3:
+        Serial.println("Wechsel zu Snake Game");
+        aktuelleTaskNummer = 0;
+        // Snake Game wird sich selbst initialisieren
+        break;
+    }
+    
+    // Längere Pause nach Task-Wechsel für saubere Initialisierung
+    vTaskDelay(pdMS_TO_TICKS(200));
+    xSemaphoreGive(taskSwitchSemaphore);
   }
 }
 
@@ -677,101 +811,138 @@ void setup() {
   Serial.begin(115200);
   delay(1000); // Kurze Wartezeit für den Serial-Monitor
   
-  Serial.println("Starte FreeRTOS LED Matrix Projekt mit 4 Tasks...");
+  Serial.println("Starte FreeRTOS LED Matrix Projekt mit verbesserter Thread-Sicherheit");
+  
+  // Semaphore für Thread-Synchronisation erstellen
+  ledMatrixSemaphore = xSemaphoreCreateMutex();
+  taskSwitchSemaphore = xSemaphoreCreateMutex();
+  
+  if (ledMatrixSemaphore == NULL || taskSwitchSemaphore == NULL) {
+    Serial.println("FEHLER: Semaphore konnten nicht erstellt werden!");
+    while(1) delay(1000); // System anhalten
+  }
   
   // DHT Sensor initialisieren
   dht.begin();
+  Serial.println("DHT22 Sensor initialisiert");
   
-  // LED Matrix Setup für beide Panels
+  // FastLED initialisieren
   FastLED.addLeds<CHIPSET, LED_PIN_UPPER, COLOR_ORDER>(upperMatrix[0], upperMatrix.Size());
   FastLED.addLeds<CHIPSET, LED_PIN_LOWER, COLOR_ORDER>(lowerMatrix[0], lowerMatrix.Size());
-  FastLED.setBrightness(10);
-  FastLED.clear(true);
+  FastLED.setBrightness(SNAKE_BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
+  Serial.println("FastLED initialisiert");
   
-  // Initialisiere die Laufschrift für das obere Panel
+  // LED Text-Objekte initialisieren
   upperScrollingMsg.SetFont(MatriseFontData);
   upperScrollingMsg.Init(&upperMatrix, upperMatrix.Width(), upperScrollingMsg.FontHeight() + 1, 0, 0);
-  upperScrollingMsg.SetScrollDirection(SCROLL_LEFT);
-  upperScrollingMsg.SetTextDirection(SCROLL_LEFT);
-  upperScrollingMsg.SetTextColrOptions(COLR_RGB | COLR_SINGLE, 0x00, 0xff, 0xff);
   
-  // Initialisiere die Laufschrift für das untere Panel
   lowerScrollingMsg.SetFont(MatriseFontData);
   lowerScrollingMsg.Init(&lowerMatrix, lowerMatrix.Width(), lowerScrollingMsg.FontHeight() + 1, 0, 0);
-  lowerScrollingMsg.SetScrollDirection(SCROLL_LEFT);
-  lowerScrollingMsg.SetTextDirection(SCROLL_LEFT);
-  lowerScrollingMsg.SetTextColrOptions(COLR_RGB | COLR_SINGLE, 0xff, 0x80, 0x00);
+  Serial.println("LED Text-Objekte initialisiert");
   
-  // Starttexte
-  strcpy((char*)upperTextBuffer, "      Verbinde mit WLAN...");
-  strcpy((char*)lowerTextBuffer, "      Verbinde mit WLAN...");
-  upperTextLength = strlen((char*)upperTextBuffer);
-  lowerTextLength = strlen((char*)lowerTextBuffer);
-  upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
-  lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
-  
-  // Initialisiere die Scroll-Flags
-  upperScrollCompleted = false;
-  lowerScrollCompleted = false;
-  
-  // Semaphore erstellen
-  ledMatrixSemaphore = xSemaphoreCreateMutex();
-  
-  // WLAN verbinden
+  // WLAN-Verbindung aufbauen
+  Serial.println("Verbinde mit WLAN...");
   WiFi.begin(ssid, password);
-  Serial.print("Verbinde mit WLAN");
-  int reconnectAttempts = 0;
-  const int maxReconnectAttempts = 20;
   
-  while (WiFi.status() != WL_CONNECTED && reconnectAttempts < maxReconnectAttempts) {
-    delay(500);
+  int wifiTimeout = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 20) {
+    delay(1000);
     Serial.print(".");
-    reconnectAttempts++;
-    
-    // LED-Matrix aktualisieren während wir auf WLAN warten
-    updateScrollText();
-    FastLED.show();
+    wifiTimeout++;
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWLAN verbunden!");
+    Serial.println();
+    Serial.println("WLAN verbunden!");
+    Serial.print("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
     
-    // Zeit von NTP-Server holen (für Task C)
+    // NTP-Zeit konfigurieren
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    
-    // Ersten Wetterbericht abrufen (für Task B)
-    updateWeather();
+    Serial.println("NTP-Zeit konfiguriert");
   } else {
-    Serial.println("\nWLAN-Verbindung fehlgeschlagen!");
+    Serial.println();
+    Serial.println("WLAN-Verbindung fehlgeschlagen!");
   }
   
-  // Text mit Begrüßung setzen
-  strcpy((char*)upperTextBuffer, "      System bereit!");
-  strcpy((char*)lowerTextBuffer, "      System bereit!");
-  upperTextLength = strlen((char*)upperTextBuffer);
-  lowerTextLength = strlen((char*)lowerTextBuffer);
-  upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
-  lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+  // Tasks mit erhöhten Stack-Größen erstellen
+  xTaskCreatePinnedToCore(
+    SnakeGameTask,
+    "SnakeGameTask",
+    8192,  // Erhöhte Stack-Größe
+    NULL,
+    2,     // Höhere Priorität für Snake Game
+    &SnakeGameTaskHandle,
+    1      // Core 1
+  );
   
-  // Berechne die ungefähre Breite der Texte
-  upperTextWidth = upperTextLength * 6;
-  lowerTextWidth = lowerTextLength * 6;
+  xTaskCreatePinnedToCore(
+    TaskB,
+    "TaskB",
+    8192,  // Erhöhte Stack-Größe
+    NULL,
+    1,
+    &TaskBHandle,
+    1      // Core 1
+  );
   
-  // Tasks erstellen
-  xTaskCreate(SnakeGameTask, "Snake Game", 4096, NULL, 1, &SnakeGameTaskHandle);
-  xTaskCreate(TaskB, "Task B", 4096, NULL, 1, &TaskBHandle);
-  xTaskCreate(TaskC, "Task C", 4096, NULL, 1, &TaskCHandle);
-  xTaskCreate(DHTTask, "DHT Task", 4096, NULL, 1, &DHTTaskHandle);
-  xTaskCreate(MenuTask, "Menu Task", 2048, NULL, 2, &MenuTaskHandle);
+  xTaskCreatePinnedToCore(
+    TaskC,
+    "TaskC",
+    8192,  // Erhöhte Stack-Größe
+    NULL,
+    1,
+    &TaskCHandle,
+    1      // Core 1
+  );
   
-  // Nur Snake Game soll anfangs laufen, die anderen Tasks pausieren
-  vTaskSuspend(TaskBHandle);
-  vTaskSuspend(TaskCHandle);
-  vTaskSuspend(DHTTaskHandle);
+  xTaskCreatePinnedToCore(
+    DHTTask,
+    "DHTTask",
+    8192,  // Erhöhte Stack-Größe
+    NULL,
+    1,
+    &DHTTaskHandle,
+    1      // Core 1
+  );
   
-  Serial.println("System bereit! Snake Game ist aktiv.");
+  xTaskCreatePinnedToCore(
+    MenuTask,
+    "MenuTask",
+    4096,  // Kleinere Stack-Größe für Menu-Task
+    NULL,
+    3,     // Höchste Priorität für Menu-Task
+    &MenuTaskHandle,
+    0      // Core 0 (getrennt von anderen Tasks)
+  );
+  
+  Serial.println("Alle Tasks erstellt und gestartet");
+  Serial.println("System bereit!");
+  Serial.println("Langer Tastendruck wechselt zwischen den Modi:");
+  Serial.println("- Snake Game");
+  Serial.println("- Wetter");
+  Serial.println("- Uhrzeit");
+  Serial.println("- DHT Sensor");
+  
+  // Initiale Anzeige löschen
+  safeClearLEDs();
+  safeShowLEDs();
 }
 
 void loop() {
-  // Die loop-Funktion bleibt leer, da alles über FreeRTOS-Tasks gesteuert wird
+  // Hauptloop bleibt leer, da alles über Tasks läuft
+  // Nur minimale Überwachung und Speicher-Freigabe
+  
+  // Task-Überwachung (optional für Debugging)
+  static unsigned long lastMemoryCheck = 0;
+  if (millis() - lastMemoryCheck > 30000) { // Alle 30 Sekunden
+    lastMemoryCheck = millis();
+    Serial.printf("Freier Heap: %d Bytes\n", ESP.getFreeHeap());
+    Serial.printf("Aktuelle Task: %d\n", aktuelleTaskNummer);
+  }
+  
+  // Sehr große Verzögerung, da alle Arbeit in Tasks erledigt wird
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
