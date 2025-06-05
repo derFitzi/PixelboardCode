@@ -442,17 +442,44 @@ void updateTemperatureDisplay() {
       sprintf(tempText, "      Temperatur wird gemessen...");
     }
     
-    // Text für oberes Panel setzen - aber NUR den Buffer aktualisieren
+    // Text für oberes Panel setzen
     strcpy((char*)upperTextBuffer, tempText);
     upperTextLength = strlen((char*)upperTextBuffer);
     upperTextWidth = upperTextLength * 6;
     
-    // Text NUR setzen wenn noch kein Text läuft (erstes Update)
-    if (upperScrollCount == 0 && upperTextLength > 0) {
-      upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
-      upperScrollCompleted = false;
+    // Text IMMER sofort setzen, nicht auf Scroll-Zyklen warten
+    upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+    upperScrollCount = 0;
+    upperScrollCompleted = false;
+    
+    ledUpdateInProgress = false;
+    xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
+void forceUpdateTemperatureDisplay() {
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    ledUpdateInProgress = true;
+    
+    // Temperaturtext für oberes Panel erstellen
+    char tempText[75];
+    if (temperaturVerfuegbar) {
+      sprintf(tempText, "      Aktuell: %.1f°C", aktuelleTemperatur);
+    } else {
+      sprintf(tempText, "      Temperatur wird gemessen...");
     }
-    // Ansonsten läuft der Text weiter und wird beim nächsten Reset-Zyklus aktualisiert
+    
+    // Text für oberes Panel setzen
+    strcpy((char*)upperTextBuffer, tempText);
+    upperTextLength = strlen((char*)upperTextBuffer);
+    upperTextWidth = upperTextLength * 6;
+    
+    // SOFORTIGE Aktualisierung - Text wird neu gesetzt
+    upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+    upperScrollCount = 0;
+    upperScrollCompleted = false;
+    
+    Serial.println("Temperaturanzeige sofort aktualisiert!");
     
     ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
@@ -733,6 +760,10 @@ void TaskC(void *parameter) {
 void DHTTask(void *parameter) {
   // Einmalige Anzeige-Initialisierung für DHTTask
   updateSensorDisplay(); // Initialisiert nur den unteren scrollenden Text
+  
+  // Direkte Initialisierung der Temperaturanzeige
+  aktuelleTemperatur = 0.0;
+  temperaturVerfuegbar = false;
   updateTemperatureDisplay(); // Initialisiert den oberen scrollenden Text
   
   while (1) {
@@ -758,24 +789,21 @@ void DHTTask(void *parameter) {
       
       if (isnan(temperatur)) {
         Serial.println("Fehler beim Lesen der Temperatur!");
-        // Nur aktualisieren wenn sich der Status geändert hat
+        // Sofort aktualisieren wenn sich der Status geändert hat
         if (temperaturVerfuegbar) {
           temperaturVerfuegbar = false;
-          updateTemperatureDisplay(); // Aktualisiere Anzeige nur bei Statusänderung
+          forceUpdateTemperatureDisplay(); // SOFORTIGE Aktualisierung
         }
       } else {
         Serial.printf("Temperatur: %.2f °C\n", temperatur);
         
-        // Nur aktualisieren wenn sich die Temperatur signifikant geändert hat oder Status sich änderte
+        // Aktualisieren wenn sich die Temperatur geändert hat oder Status sich änderte
         if (!temperaturVerfuegbar || abs(aktuelleTemperatur - temperatur) > 0.1) {
           aktuelleTemperatur = temperatur;
-          bool statusChanged = !temperaturVerfuegbar;
           temperaturVerfuegbar = true;
           
-          // Nur bei signifikanten Änderungen oder Statuswechsel Display aktualisieren
-          if (statusChanged || abs(aktuelleTemperatur - temperatur) > 0.1) {
-            updateTemperatureDisplay(); // Aktualisiere die scrollende Temperaturanzeige
-          }
+          // SOFORTIGE Aktualisierung der Anzeige
+          forceUpdateTemperatureDisplay();
         }
         
         // Sende Daten in separater Task um Blocking zu vermeiden
@@ -827,8 +855,8 @@ void DHTTask(void *parameter) {
     
     safeShowLEDs();
     
-    // Verzögerung für flüssiges Scrolling
-    vTaskDelay(pdMS_TO_TICKS(80));
+    // Reduzierte Verzögerung für schnelleres Scrolling und Updates
+    vTaskDelay(pdMS_TO_TICKS(60)); // Von 80ms auf 60ms reduziert
   }
 }
 
