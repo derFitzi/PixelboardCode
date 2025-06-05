@@ -442,23 +442,23 @@ void updateTemperatureDisplay() {
       sprintf(tempText, "      Temperatur wird gemessen...");
     }
     
-    // Text für oberes Panel setzen
+    // Text für oberes Panel setzen - aber NUR den Buffer aktualisieren
     strcpy((char*)upperTextBuffer, tempText);
     upperTextLength = strlen((char*)upperTextBuffer);
     upperTextWidth = upperTextLength * 6;
     
-    // Setze neuen Text nur, wenn der vorherige Text vollständig gescrollt wurde
-    // oder wenn wir gerade das erste Update durchführen
-    if (upperScrollCompleted || upperScrollCount == 0) {
+    // Text NUR setzen wenn noch kein Text läuft (erstes Update)
+    if (upperScrollCount == 0 && upperTextLength > 0) {
       upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
-      upperScrollCount = 0;
       upperScrollCompleted = false;
     }
+    // Ansonsten läuft der Text weiter und wird beim nächsten Reset-Zyklus aktualisiert
     
     ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
   }
 }
+
 // ================= SNAKE GAME FUNKTIONEN =================
 
 bool isOnBorder(int x, int y) {
@@ -758,16 +758,24 @@ void DHTTask(void *parameter) {
       
       if (isnan(temperatur)) {
         Serial.println("Fehler beim Lesen der Temperatur!");
-        temperaturVerfuegbar = false;
-        updateTemperatureDisplay(); // Aktualisiere Anzeige auch bei Fehler
+        // Nur aktualisieren wenn sich der Status geändert hat
+        if (temperaturVerfuegbar) {
+          temperaturVerfuegbar = false;
+          updateTemperatureDisplay(); // Aktualisiere Anzeige nur bei Statusänderung
+        }
       } else {
         Serial.printf("Temperatur: %.2f °C\n", temperatur);
         
-        // Nur aktualisieren wenn sich die Temperatur geändert hat
+        // Nur aktualisieren wenn sich die Temperatur signifikant geändert hat oder Status sich änderte
         if (!temperaturVerfuegbar || abs(aktuelleTemperatur - temperatur) > 0.1) {
           aktuelleTemperatur = temperatur;
+          bool statusChanged = !temperaturVerfuegbar;
           temperaturVerfuegbar = true;
-          updateTemperatureDisplay(); // Aktualisiere die scrollende Temperaturanzeige
+          
+          // Nur bei signifikanten Änderungen oder Statuswechsel Display aktualisieren
+          if (statusChanged || abs(aktuelleTemperatur - temperatur) > 0.1) {
+            updateTemperatureDisplay(); // Aktualisiere die scrollende Temperaturanzeige
+          }
         }
         
         // Sende Daten in separater Task um Blocking zu vermeiden
@@ -802,6 +810,7 @@ void DHTTask(void *parameter) {
       if (upperScrollCount >= upperResetLimit) {
         upperScrollCount = 0;
         upperScrollCompleted = true;
+        // Verwende den aktuellen Buffer-Inhalt für den neuen Scroll-Durchgang
         upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
       }
 
