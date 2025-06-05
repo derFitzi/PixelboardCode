@@ -97,6 +97,10 @@ bool sensorReadRequested = false;
 unsigned long sensorRequestTime = 0;
 const unsigned long sensorReadDelay = 10; // Minimale Wartezeit zwischen Anfrage und Lesen
 
+// Variable zum Speichern der aktuellen DHT-Temperatur
+float aktuelleTemperatur = 0.0;
+bool temperaturVerfuegbar = false;
+
 // Semaphore für den Zugriff auf die LED-Matrix - KRITISCH für Thread-Sicherheit
 SemaphoreHandle_t ledMatrixSemaphore = NULL;
 
@@ -179,7 +183,7 @@ void updateScrollText() {
         lowerResetLimit = lowerTextWidth + MATRIX_WIDTH-30;
         break;
       case 3: // DHTTask
-        upperResetLimit = 0; // Wird nicht verwendet
+        upperResetLimit = upperTextWidth + MATRIX_WIDTH-32;
         lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
         break;
       default: // Snake Game
@@ -407,26 +411,56 @@ void updateSensorDisplay() {
   if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
     ledUpdateInProgress = true;
     
-    // Oberes Panel leer lassen
-    FastLED.clear();
-    
-    // Text für unteres Panel formatieren
-    char sensorText[75];
-    sprintf(sensorText, "      Temperatur wird gemessen");
-    
-    // Text für LED-Matrix setzen
-    strcpy((char*)lowerTextBuffer, sensorText);
-    lowerTextLength = strlen((char*)lowerTextBuffer);
-    
-    // Berechne die ungefähre Breite des Textes
-    lowerTextWidth = lowerTextLength * 6;
-    
-    // Setze neuen Text
-    if (lowerScrollCompleted || lowerScrollCount == 0) {
+    // Text für unteres Panel formatieren (Status) - nur beim ersten Aufruf
+    if (lowerTextLength == 0) {
+      char sensorText[75];
+      sprintf(sensorText, "      Temperatur wird gemessen");
+      
+      strcpy((char*)lowerTextBuffer, sensorText);
+      lowerTextLength = strlen((char*)lowerTextBuffer);
+      lowerTextWidth = lowerTextLength * 6;
+      
       lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
       lowerScrollCount = 0;
       lowerScrollCompleted = false;
     }
+    
+    ledUpdateInProgress = false;
+    xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
+void updateTemperatureDisplay() {
+  if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+    ledUpdateInProgress = true;
+    
+    // Oberes Panel komplett löschen
+    for (int x = 0; x < MATRIX_WIDTH; x++) {
+      for (int y = 0; y < MATRIX_HEIGHT; y++) {
+        upperMatrix(x, y) = CRGB::Black;
+      }
+    }
+    
+    // Temperaturtext erstellen
+    char tempText[20];
+    if (temperaturVerfuegbar) {
+      sprintf(tempText, "%.1f°C", aktuelleTemperatur);
+    } else {
+      sprintf(tempText, "---°C");
+    }
+    
+    // Text-Objekt für statische Anzeige erstellen
+    cLEDText staticTempText;
+    staticTempText.SetFont(MatriseFontData);
+    
+    // Textbreite berechnen
+    int textWidth = strlen(tempText) * 6; // Ungefähre Breite pro Zeichen
+    int startX = (MATRIX_WIDTH - textWidth) / 2; // Zentriert
+    if (startX < 0) startX = 0;
+    
+    // Text in der Mitte des oberen Panels anzeigen
+    staticTempText.Init(&upperMatrix, upperMatrix.Width(), staticTempText.FontHeight() + 1, startX, 0);
+    staticTempText.SetText((unsigned char*)tempText, strlen(tempText));
     
     ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
@@ -706,7 +740,8 @@ void TaskC(void *parameter) {
 // DHTTask: Sensordaten auslesen und senden
 void DHTTask(void *parameter) {
   // Einmalige Anzeige-Initialisierung für DHTTask
-  updateSensorDisplay();
+  updateSensorDisplay(); // Initialisiert nur den unteren scrollenden Text
+  updateTemperatureDisplay(); // Initialisiert die statische Temperaturanzeige
   
   while (1) {
     // Prüfe ob diese Task noch aktiv sein soll
@@ -731,8 +766,21 @@ void DHTTask(void *parameter) {
       
       if (isnan(temperatur)) {
         Serial.println("Fehler beim Lesen der Temperatur!");
+        // Auch bei Fehler Display aktualisieren (zeigt alte Werte oder Fehlermeldung)
+        temperaturVerfuegbar = false;
+        updateTemperatureDisplay(); // Nur Temperaturanzeige aktualisieren
       } else {
         Serial.printf("Temperatur: %.2f °C\n", temperatur);
+        
+        // Nur aktualisieren wenn sich die Temperatur geändert hat
+        if (!temperaturVerfuegbar || abs(aktuelleTemperatur - temperatur) > 0.1) {
+          aktuelleTemperatur = temperatur;
+          temperaturVerfuegbar = true;
+          
+          // Nur die Temperaturanzeige aktualisieren, nicht den scrollenden Text
+          updateTemperatureDisplay();
+        }
+        
         // Sende Daten in separater Task um Blocking zu vermeiden
         xTaskCreate([](void* param) {
           float temp = *((float*)param);
@@ -745,8 +793,25 @@ void DHTTask(void *parameter) {
       lastSensorRead = currentMillis;
     }
     
-    // Text scrollen und anzeigen (läuft kontinuierlich)
-    updateScrollText();
+    // Text scrollen und anzeigen (läuft kontinuierlich, aber nur für unteren Text)
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      ledUpdateInProgress = true;
+      
+      // Nur den unteren scrollenden Text aktualisieren
+      lowerScrollingMsg.UpdateText();
+      lowerScrollCount++;
+      
+      int lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
+      if (lowerScrollCount >= lowerResetLimit) {
+        lowerScrollCount = 0;
+        lowerScrollCompleted = true;
+        lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+      }
+      
+      ledUpdateInProgress = false;
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
+    
     safeShowLEDs();
     
     // Sehr kurze Verzögerung für flüssiges Scrolling
@@ -867,9 +932,11 @@ void setup() {
   // LED Text-Objekte initialisieren
   upperScrollingMsg.SetFont(MatriseFontData);
   upperScrollingMsg.Init(&upperMatrix, upperMatrix.Width(), upperScrollingMsg.FontHeight() + 1, 0, 0);
+  upperScrollingMsg.SetTextColrOptions(COLR_RGB | COLR_SINGLE, 0x00, 0xff, 0xff);
   
   lowerScrollingMsg.SetFont(MatriseFontData);
   lowerScrollingMsg.Init(&lowerMatrix, lowerMatrix.Width(), lowerScrollingMsg.FontHeight() + 1, 0, 0);
+  lowerScrollingMsg.SetTextColrOptions(COLR_RGB | COLR_SINGLE, 0xff, 0x80, 0x00);
   Serial.println("LED Text-Objekte initialisiert");
   
   // WLAN-Verbindung aufbauen
