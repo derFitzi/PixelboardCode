@@ -434,39 +434,31 @@ void updateTemperatureDisplay() {
   if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
     ledUpdateInProgress = true;
     
-    // Oberes Panel komplett löschen
-    for (int x = 0; x < MATRIX_WIDTH; x++) {
-      for (int y = 0; y < MATRIX_HEIGHT; y++) {
-        upperMatrix(x, y) = CRGB::Black;
-      }
-    }
-    
-    // Temperaturtext erstellen
-    char tempText[20];
+    // Temperaturtext für oberes Panel (scrollend) erstellen
+    char tempText[75];
     if (temperaturVerfuegbar) {
-      sprintf(tempText, "%.1f°C", aktuelleTemperatur);
+      sprintf(tempText, "      Aktuell: %.1f°C", aktuelleTemperatur);
     } else {
-      sprintf(tempText, "---°C");
+      sprintf(tempText, "      Temperatur wird gemessen...");
     }
     
-    // Text-Objekt für statische Anzeige erstellen
-    cLEDText staticTempText;
-    staticTempText.SetFont(MatriseFontData);
+    // Text für oberes Panel setzen
+    strcpy((char*)upperTextBuffer, tempText);
+    upperTextLength = strlen((char*)upperTextBuffer);
+    upperTextWidth = upperTextLength * 6;
     
-    // Textbreite berechnen
-    int textWidth = strlen(tempText) * 6; // Ungefähre Breite pro Zeichen
-    int startX = (MATRIX_WIDTH - textWidth) / 2; // Zentriert
-    if (startX < 0) startX = 0;
-    
-    // Text in der Mitte des oberen Panels anzeigen
-    staticTempText.Init(&upperMatrix, upperMatrix.Width(), staticTempText.FontHeight() + 1, startX, 0);
-    staticTempText.SetText((unsigned char*)tempText, strlen(tempText));
+    // Setze neuen Text nur, wenn der vorherige Text vollständig gescrollt wurde
+    // oder wenn wir gerade das erste Update durchführen
+    if (upperScrollCompleted || upperScrollCount == 0) {
+      upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+      upperScrollCount = 0;
+      upperScrollCompleted = false;
+    }
     
     ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
   }
 }
-
 // ================= SNAKE GAME FUNKTIONEN =================
 
 bool isOnBorder(int x, int y) {
@@ -741,7 +733,7 @@ void TaskC(void *parameter) {
 void DHTTask(void *parameter) {
   // Einmalige Anzeige-Initialisierung für DHTTask
   updateSensorDisplay(); // Initialisiert nur den unteren scrollenden Text
-  updateTemperatureDisplay(); // Initialisiert die statische Temperaturanzeige
+  updateTemperatureDisplay(); // Initialisiert den oberen scrollenden Text
   
   while (1) {
     // Prüfe ob diese Task noch aktiv sein soll
@@ -766,9 +758,8 @@ void DHTTask(void *parameter) {
       
       if (isnan(temperatur)) {
         Serial.println("Fehler beim Lesen der Temperatur!");
-        // Auch bei Fehler Display aktualisieren (zeigt alte Werte oder Fehlermeldung)
         temperaturVerfuegbar = false;
-        updateTemperatureDisplay(); // Nur Temperaturanzeige aktualisieren
+        updateTemperatureDisplay(); // Aktualisiere Anzeige auch bei Fehler
       } else {
         Serial.printf("Temperatur: %.2f °C\n", temperatur);
         
@@ -776,9 +767,7 @@ void DHTTask(void *parameter) {
         if (!temperaturVerfuegbar || abs(aktuelleTemperatur - temperatur) > 0.1) {
           aktuelleTemperatur = temperatur;
           temperaturVerfuegbar = true;
-          
-          // Nur die Temperaturanzeige aktualisieren, nicht den scrollenden Text
-          updateTemperatureDisplay();
+          updateTemperatureDisplay(); // Aktualisiere die scrollende Temperaturanzeige
         }
         
         // Sende Daten in separater Task um Blocking zu vermeiden
@@ -793,15 +782,30 @@ void DHTTask(void *parameter) {
       lastSensorRead = currentMillis;
     }
     
-    // Text scrollen und anzeigen (läuft kontinuierlich, aber nur für unteren Text)
+    // Text für beide Panels scrollen und anzeigen
     if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
       ledUpdateInProgress = true;
       
-      // Nur den unteren scrollenden Text aktualisieren
+      // Update oberes Panel (Temperatur)
+      upperScrollingMsg.UpdateText();
+      upperScrollCount++;
+
+      // Update unteres Panel (Status)
       lowerScrollingMsg.UpdateText();
       lowerScrollCount++;
-      
+
+      // Scroll-Reset-Grenzen für DHT Task
+      int upperResetLimit = upperTextWidth + MATRIX_WIDTH - 32;
       int lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 30;
+
+      // Scroll-Reset für oberes Panel
+      if (upperScrollCount >= upperResetLimit) {
+        upperScrollCount = 0;
+        upperScrollCompleted = true;
+        upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+      }
+
+      // Scroll-Reset für unteres Panel
       if (lowerScrollCount >= lowerResetLimit) {
         lowerScrollCount = 0;
         lowerScrollCompleted = true;
@@ -814,8 +818,8 @@ void DHTTask(void *parameter) {
     
     safeShowLEDs();
     
-    // Sehr kurze Verzögerung für flüssiges Scrolling
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // Verzögerung für flüssiges Scrolling
+    vTaskDelay(pdMS_TO_TICKS(80));
   }
 }
 
