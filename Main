@@ -12,8 +12,8 @@
 
 // Task-Handles mit erhöhter Stack-Größe
 TaskHandle_t SnakeGameTaskHandle = NULL;
-TaskHandle_t TaskBHandle = NULL;
-TaskHandle_t TaskCHandle = NULL;
+TaskHandle_t WetterTaskHandle = NULL;
+TaskHandle_t UhrzeitTaskHandle = NULL;
 TaskHandle_t DHTTaskHandle = NULL;
 TaskHandle_t MenuTaskHandle = NULL;
 
@@ -699,7 +699,7 @@ void SnakeGameTask(void *parameter) {
 }
 
 // Task B: Zeigt Wetterdaten auf LED-Matrix an
-void TaskB(void *parameter) {
+void WetterTask(void *parameter) {
   while (1) {
     // Prüfe ob diese Task noch aktiv sein soll
     if (aktuelleTaskNummer != 1) {
@@ -730,8 +730,8 @@ void TaskB(void *parameter) {
   }
 }
 
-// Task C: Zeigt Uhrzeit auf LED-Matrix an 
-void TaskC(void *parameter) {
+// UhrzeitTask: Zeigt Uhrzeit auf LED-Matrix an 
+void UhrzeitTask(void *parameter) {
   while (1) {
     // Prüfe ob diese Task noch aktiv sein soll
     if (aktuelleTaskNummer != 2) {
@@ -760,6 +760,8 @@ void TaskC(void *parameter) {
 void DHTTask(void *parameter) {
   // Einmalige Anzeige-Initialisierung für DHTTask
   updateSensorDisplay(); // Initialisiert nur den unteren scrollenden Text
+  
+  
   
   // Direkte Initialisierung der Temperaturanzeige
   aktuelleTemperatur = 0.0;
@@ -1017,22 +1019,22 @@ void setup() {
   );
   
   xTaskCreatePinnedToCore(
-    TaskB,
-    "TaskB",
+    WetterTask,
+    "WetterTask",
     8192,  // Erhöhte Stack-Größe
     NULL,
     1,
-    &TaskBHandle,
+    &WetterTaskHandle,
     1      // Core 1
   );
   
   xTaskCreatePinnedToCore(
-    TaskC,
-    "TaskC",
+    UhrzeitTask,
+    "UhrzeitTask",
     8192,  // Erhöhte Stack-Größe
     NULL,
     1,
-    &TaskCHandle,
+    &UhrzeitTaskHandle,
     1      // Core 1
   );
   
