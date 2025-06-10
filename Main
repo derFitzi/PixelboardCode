@@ -469,17 +469,24 @@ void forceUpdateTemperatureDisplay() {
       sprintf(tempText, "      Temperatur wird gemessen...");
     }
     
-    // Text für oberes Panel setzen
-    strcpy((char*)upperTextBuffer, tempText);
-    upperTextLength = strlen((char*)upperTextBuffer);
-    upperTextWidth = upperTextLength * 6;
+    // Prüfen ob sich der Text tatsächlich geändert hat
+    bool textHatSichGeaendert = (strcmp((char*)upperTextBuffer, tempText) != 0);
     
-    // SOFORTIGE Aktualisierung - Text wird neu gesetzt
-    upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
-    upperScrollCount = 0;
-    upperScrollCompleted = false;
-    
-    Serial.println("Temperaturanzeige sofort aktualisiert!");
+    if (textHatSichGeaendert) {
+      // Text für oberes Panel setzen
+      strcpy((char*)upperTextBuffer, tempText);
+      upperTextLength = strlen((char*)upperTextBuffer);
+      upperTextWidth = upperTextLength * 6;
+      
+      // SOFORTIGE Aktualisierung - Text wird neu gesetzt
+      upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+      upperScrollCount = 0;
+      upperScrollCompleted = false;
+      
+      Serial.println("Temperaturanzeige sofort aktualisiert (Text geändert)!");
+    } else {
+      Serial.println("Temperaturanzeige: Text unverändert, kein Reset");
+    }
     
     ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
@@ -761,18 +768,26 @@ void DHTTask(void *parameter) {
   // Einmalige Anzeige-Initialisierung für DHTTask
   updateSensorDisplay(); // Initialisiert nur den unteren scrollenden Text
   
-  
-  
   // Direkte Initialisierung der Temperaturanzeige
   aktuelleTemperatur = 0.0;
   temperaturVerfuegbar = false;
-  updateTemperatureDisplay(); // Initialisiert den oberen scrollenden Text
+  
+  // Flag um zu verfolgen ob die Temperaturanzeige bereits initialisiert wurde
+  bool temperaturDisplayInitialisiert = false;
   
   while (1) {
     // Prüfe ob diese Task noch aktiv sein soll
     if (aktuelleTaskNummer != 3) {
+      // Task ist nicht mehr aktiv - Reset für nächsten Aufruf
+      temperaturDisplayInitialisiert = false;
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
+    }
+    
+    // Initialisierung nur beim ersten Aufruf dieser Task
+    if (!temperaturDisplayInitialisiert) {
+      updateTemperatureDisplay(); // Initialisiert den oberen scrollenden Text
+      temperaturDisplayInitialisiert = true;
     }
     
     unsigned long currentMillis = millis();
@@ -791,20 +806,23 @@ void DHTTask(void *parameter) {
       
       if (isnan(temperatur)) {
         Serial.println("Fehler beim Lesen der Temperatur!");
-        // Sofort aktualisieren wenn sich der Status geändert hat
+        // Sofort aktualisieren nur wenn sich der Status tatsächlich geändert hat
         if (temperaturVerfuegbar) {
           temperaturVerfuegbar = false;
-          forceUpdateTemperatureDisplay(); // SOFORTIGE Aktualisierung
+          forceUpdateTemperatureDisplay(); // SOFORTIGE Aktualisierung nur bei Statusänderung
         }
       } else {
         Serial.printf("Temperatur: %.2f °C\n", temperatur);
         
-        // Aktualisieren wenn sich die Temperatur geändert hat oder Status sich änderte
-        if (!temperaturVerfuegbar || abs(aktuelleTemperatur - temperatur) > 0.1) {
+        // Aktualisieren nur wenn sich die Temperatur signifikant geändert hat oder Status sich änderte
+        bool statusGeaendert = !temperaturVerfuegbar;
+        bool temperaturGeaendert = temperaturVerfuegbar && (abs(aktuelleTemperatur - temperatur) > 0.1);
+        
+        if (statusGeaendert || temperaturGeaendert) {
           aktuelleTemperatur = temperatur;
           temperaturVerfuegbar = true;
           
-          // SOFORTIGE Aktualisierung der Anzeige
+          // SOFORTIGE Aktualisierung nur bei tatsächlicher Änderung
           forceUpdateTemperatureDisplay();
         }
         
