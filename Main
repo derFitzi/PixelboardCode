@@ -316,6 +316,10 @@ void updateTimeDisplay() {
       sprintf(dateText, "      %02d.%02d.%04d",
               timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_year + 1900);
       
+      // Prüfen ob sich der Text geändert hat (um unnötige Resets zu vermeiden)
+      bool upperTextChanged = (strcmp((char*)upperTextBuffer, timeText) != 0);
+      bool lowerTextChanged = (strcmp((char*)lowerTextBuffer, dateText) != 0);
+      
       // Texte für LED-Matrizen setzen
       strcpy((char*)upperTextBuffer, timeText);
       strcpy((char*)lowerTextBuffer, dateText);
@@ -326,15 +330,16 @@ void updateTimeDisplay() {
       upperTextWidth = upperTextLength * 6;
       lowerTextWidth = lowerTextLength * 6;
       
-      // Setze neuen Text nur, wenn der vorherige Text vollständig gescrollt wurde
-      // oder wenn wir gerade das erste Update durchführen
-      if (upperScrollCompleted || upperScrollCount == 0) {
+      // Setze neuen Text nur wenn:
+      // 1. Das erste Update ist (upperScrollCount == 0)
+      // 2. Der Text sich geändert hat UND ein vollständiger Scroll-Durchgang abgeschlossen ist
+      if (upperScrollCount == 0 || (upperTextChanged && upperScrollCompleted)) {
         upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
         upperScrollCount = 0;
         upperScrollCompleted = false;
       }
       
-      if (lowerScrollCompleted || lowerScrollCount == 0) {
+      if (lowerScrollCount == 0 || (lowerTextChanged && lowerScrollCompleted)) {
         lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
         lowerScrollCount = 0;
         lowerScrollCompleted = false;
@@ -783,24 +788,62 @@ void WetterTask(void *parameter) {
 
 // UhrzeitTask: Zeigt Uhrzeit auf LED-Matrix an 
 void UhrzeitTask(void *parameter) {
+  // Flag um das erste Update zu markieren
+  bool ersterAufruf = true;
+  
   while (1) {
     // Prüfe ob diese Task noch aktiv sein soll
     if (aktuelleTaskNummer != 2) {
+      ersterAufruf = true; // Reset für nächsten Task-Wechsel
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
     
     Serial.println("Task C - Uhrzeit");
     
-    // Zeit aktualisieren - beim ersten Aufruf oder nach Intervall
+    // Zeit aktualisieren - beim ersten Aufruf sofort, danach nach Intervall
     unsigned long currentMillis = millis();
-    if (currentMillis - lastTimeUpdate >= timeUpdateInterval || lastTimeUpdate == 0) {
+    if (ersterAufruf || currentMillis - lastTimeUpdate >= timeUpdateInterval) {
       lastTimeUpdate = currentMillis;
       updateTimeDisplay();
+      ersterAufruf = false;
     }
     
-    // Text scrollen und anzeigen
-    updateScrollText();
+    // Spezielle Scroll-Behandlung für Uhrzeit
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      ledUpdateInProgress = true;
+      
+      // Update oberes Panel
+      upperScrollingMsg.UpdateText();
+      upperScrollCount++;
+
+      // Update unteres Panel
+      lowerScrollingMsg.UpdateText();
+      lowerScrollCount++;
+
+      // Scroll-Reset-Grenzen für Task C (Uhrzeit) - etwas konservativer
+      int upperResetLimit = upperTextWidth + MATRIX_WIDTH - 28; // Etwas früher reset
+      int lowerResetLimit = lowerTextWidth + MATRIX_WIDTH - 28;
+
+      // Scroll-Reset nur wenn der gesamte Text durchgelaufen ist
+      if (upperScrollCount >= upperResetLimit) {
+        upperScrollCount = 0;
+        upperScrollCompleted = true;
+        // Verwende aktuellen Buffer für nahtlosen Übergang
+        upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+      }
+
+      if (lowerScrollCount >= lowerResetLimit) {
+        lowerScrollCount = 0;
+        lowerScrollCompleted = true;
+        lowerScrollingMsg.SetText(lowerTextBuffer, lowerTextLength);
+      }
+      
+      ledUpdateInProgress = false;
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
+    
+    // LEDs anzeigen
     safeShowLEDs();
     
     vTaskDelay(pdMS_TO_TICKS(100));
