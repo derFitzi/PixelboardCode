@@ -82,6 +82,8 @@ const unsigned long sensorReadInterval = 5000;     // Sensor alle 5 Sekunden aus
 // Variable zum Speichern der Wetterdaten (Task B)
 float temperature = 0.0;
 String weatherDescription = "";
+bool neueTemperaturVerfuegbar = false;
+float letzteAngezeigeTemperatur = -999.0; // Unmöglicher Wert als Initial
 
 // Variable zum Verfolgen der Scrollposition
 int upperScrollCount = 0;
@@ -483,6 +485,10 @@ void forceUpdateTemperatureDisplay() {
       upperScrollCount = 0;
       upperScrollCompleted = false;
       
+      // Merken welche Temperatur angezeigt wird
+      letzteAngezeigeTemperatur = temperaturVerfuegbar ? aktuelleTemperatur : -999.0;
+      neueTemperaturVerfuegbar = false;
+      
       Serial.println("Temperaturanzeige sofort aktualisiert (Text geändert)!");
     } else {
       Serial.println("Temperaturanzeige: Text unverändert, kein Reset");
@@ -490,6 +496,44 @@ void forceUpdateTemperatureDisplay() {
     
     ledUpdateInProgress = false;
     xSemaphoreGive(ledMatrixSemaphore);
+  }
+}
+
+void updateTemperatureDisplayOnlyAtStart() {
+  // Nur aktualisieren wenn:
+  // 1. Eine neue Temperatur verfügbar ist UND
+  // 2. Der obere Scroll komplett durchgelaufen ist (oder das erste Mal)
+  if (neueTemperaturVerfuegbar && (upperScrollCompleted || upperScrollCount == 0)) {
+    if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
+      ledUpdateInProgress = true;
+      
+      // Temperaturtext für oberes Panel erstellen
+      char tempText[75];
+      if (temperaturVerfuegbar) {
+        sprintf(tempText, "      Aktuell: %.1f°C", aktuelleTemperatur);
+      } else {
+        sprintf(tempText, "      Temperatur wird gemessen...");
+      }
+      
+      // Text für oberes Panel setzen
+      strcpy((char*)upperTextBuffer, tempText);
+      upperTextLength = strlen((char*)upperTextBuffer);
+      upperTextWidth = upperTextLength * 6;
+      
+      // Text neu starten
+      upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+      upperScrollCount = 0;
+      upperScrollCompleted = false;
+      
+      // Status aktualisieren
+      letzteAngezeigeTemperatur = temperaturVerfuegbar ? aktuelleTemperatur : -999.0;
+      neueTemperaturVerfuegbar = false;
+      
+      Serial.println("Temperatur am Scroll-Anfang aktualisiert!");
+      
+      ledUpdateInProgress = false;
+      xSemaphoreGive(ledMatrixSemaphore);
+    }
   }
 }
 
@@ -764,6 +808,7 @@ void UhrzeitTask(void *parameter) {
 }
 
 // DHTTask: Sensordaten auslesen und senden
+// DHTTask: Sensordaten auslesen und senden
 void DHTTask(void *parameter) {
   // Einmalige Anzeige-Initialisierung für DHTTask
   updateSensorDisplay(); // Initialisiert nur den unteren scrollenden Text
@@ -771,28 +816,55 @@ void DHTTask(void *parameter) {
   // Direkte Initialisierung der Temperaturanzeige
   aktuelleTemperatur = 0.0;
   temperaturVerfuegbar = false;
+  neueTemperaturVerfuegbar = false;
+  letzteAngezeigeTemperatur = -999.0;
   
   // Flag um zu verfolgen ob die Temperaturanzeige bereits initialisiert wurde
   bool temperaturDisplayInitialisiert = false;
+  bool ersterSensorReadAbgeschlossen = false;
   
   while (1) {
     // Prüfe ob diese Task noch aktiv sein soll
     if (aktuelleTaskNummer != 3) {
       // Task ist nicht mehr aktiv - Reset für nächsten Aufruf
       temperaturDisplayInitialisiert = false;
+      ersterSensorReadAbgeschlossen = false;
+      neueTemperaturVerfuegbar = false;
+      letzteAngezeigeTemperatur = -999.0;
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
     
-    // Initialisierung nur beim ersten Aufruf dieser Task
-    if (!temperaturDisplayInitialisiert) {
+    // Beim ersten Aufruf sofort Sensor lesen (blockierend)
+    if (!temperaturDisplayInitialisiert && !ersterSensorReadAbgeschlossen) {
+      Serial.println("DHTTask - Erster Sensor-Read beim Start");
+      
+      // Sofortiger Sensor-Read beim ersten Start
+      float temperatur = dht.readTemperature();
+      
+      if (!isnan(temperatur)) {
+        Serial.printf("Erste Temperatur erfolgreich gelesen: %.2f °C\n", temperatur);
+        aktuelleTemperatur = temperatur;
+        temperaturVerfuegbar = true;
+        neueTemperaturVerfuegbar = true;
+      } else {
+        Serial.println("Erster Sensor-Read fehlgeschlagen - verwende Standard-Text");
+        temperaturVerfuegbar = false;
+      }
+      
+      ersterSensorReadAbgeschlossen = true;
+      lastSensorRead = millis(); // Timer für weitere Readings setzen
+    }
+    
+    // Initialisierung der Anzeige nach dem ersten Sensor-Read
+    if (!temperaturDisplayInitialisiert && ersterSensorReadAbgeschlossen) {
       updateTemperatureDisplay(); // Initialisiert den oberen scrollenden Text
       temperaturDisplayInitialisiert = true;
     }
     
     unsigned long currentMillis = millis();
     
-    // Sensor-Leseanfrage starten (nicht-blockierend)
+    // Weitere Sensor-Leseanfragen (nicht-blockierend)
     if (currentMillis - lastSensorRead >= sensorReadInterval && !sensorReadRequested) {
       sensorReadRequested = true;
       sensorRequestTime = currentMillis;
@@ -806,24 +878,23 @@ void DHTTask(void *parameter) {
       
       if (isnan(temperatur)) {
         Serial.println("Fehler beim Lesen der Temperatur!");
-        // Sofort aktualisieren nur wenn sich der Status tatsächlich geändert hat
+        // Status ändern wenn vorher Temperatur verfügbar war
         if (temperaturVerfuegbar) {
           temperaturVerfuegbar = false;
-          forceUpdateTemperatureDisplay(); // SOFORTIGE Aktualisierung nur bei Statusänderung
+          neueTemperaturVerfuegbar = true; // Markiere dass Update nötig ist
         }
       } else {
         Serial.printf("Temperatur: %.2f °C\n", temperatur);
         
-        // Aktualisieren nur wenn sich die Temperatur signifikant geändert hat oder Status sich änderte
+        // Prüfen ob Update nötig ist
         bool statusGeaendert = !temperaturVerfuegbar;
         bool temperaturGeaendert = temperaturVerfuegbar && (abs(aktuelleTemperatur - temperatur) > 0.1);
         
         if (statusGeaendert || temperaturGeaendert) {
           aktuelleTemperatur = temperatur;
           temperaturVerfuegbar = true;
-          
-          // SOFORTIGE Aktualisierung nur bei tatsächlicher Änderung
-          forceUpdateTemperatureDisplay();
+          neueTemperaturVerfuegbar = true; // Markiere dass Update nötig ist
+          Serial.println("Neue Temperatur verfügbar - wartet auf Scroll-Completion");
         }
         
         // Sende Daten in separater Task um Blocking zu vermeiden
@@ -837,6 +908,9 @@ void DHTTask(void *parameter) {
       sensorReadRequested = false;
       lastSensorRead = currentMillis;
     }
+    
+    // Temperatur-Update nur am Scroll-Anfang prüfen
+    updateTemperatureDisplayOnlyAtStart();
     
     // Text für beide Panels scrollen und anzeigen
     if (xSemaphoreTake(ledMatrixSemaphore, portMAX_DELAY) == pdTRUE) {
@@ -860,6 +934,7 @@ void DHTTask(void *parameter) {
         upperScrollCompleted = true;
         // Verwende den aktuellen Buffer-Inhalt für den neuen Scroll-Durchgang
         upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+        Serial.println("Oberer Scroll komplett - bereit für Temperatur-Update");
       }
 
       // Scroll-Reset für unteres Panel
@@ -876,7 +951,7 @@ void DHTTask(void *parameter) {
     safeShowLEDs();
     
     // Reduzierte Verzögerung für schnelleres Scrolling und Updates
-    vTaskDelay(pdMS_TO_TICKS(60)); // Von 80ms auf 60ms reduziert
+    vTaskDelay(pdMS_TO_TICKS(60));
   }
 }
 
