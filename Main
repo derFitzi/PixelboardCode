@@ -520,21 +520,30 @@ void updateTemperatureDisplayOnlyAtStart() {
         sprintf(tempText, "      Temperatur wird gemessen...");
       }
       
-      // Text für oberes Panel setzen
-      strcpy((char*)upperTextBuffer, tempText);
-      upperTextLength = strlen((char*)upperTextBuffer);
-      upperTextWidth = upperTextLength * 6;
+      // NUR aktualisieren wenn sich der Text tatsächlich geändert hat
+      bool textHatSichGeaendert = (strcmp((char*)upperTextBuffer, tempText) != 0);
       
-      // Text neu starten
-      upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
-      upperScrollCount = 0;
-      upperScrollCompleted = false;
+      if (textHatSichGeaendert) {
+        // Text für oberes Panel setzen
+        strcpy((char*)upperTextBuffer, tempText);
+        upperTextLength = strlen((char*)upperTextBuffer);
+        upperTextWidth = upperTextLength * 6;
+        
+        // Text neu starten
+        upperScrollingMsg.SetText(upperTextBuffer, upperTextLength);
+        upperScrollCount = 0;
+        upperScrollCompleted = false;
+        
+        Serial.println("Temperatur am Scroll-Anfang aktualisiert (Text geändert)!");
+      } else {
+        Serial.println("Temperatur unverändert, kein Text-Reset");
+      }
       
-      // Status aktualisieren
-      letzteAngezeigeTemperatur = temperaturVerfuegbar ? aktuelleTemperatur : -999.0;
-      neueTemperaturVerfuegbar = false;
-      
-      Serial.println("Temperatur am Scroll-Anfang aktualisiert!");
+      // Status aktualisieren - nur wenn tatsächlich aktualisiert wurde
+      if (textHatSichGeaendert) {
+        letzteAngezeigeTemperatur = temperaturVerfuegbar ? aktuelleTemperatur : -999.0;
+        neueTemperaturVerfuegbar = false;
+      }
       
       ledUpdateInProgress = false;
       xSemaphoreGive(ledMatrixSemaphore);
@@ -890,6 +899,7 @@ void DHTTask(void *parameter) {
         aktuelleTemperatur = temperatur;
         temperaturVerfuegbar = true;
         neueTemperaturVerfuegbar = true;
+        letzteAngezeigeTemperatur = temperatur; // Wichtig: Als angezeigt markieren
       } else {
         Serial.println("Erster Sensor-Read fehlgeschlagen - verwende Standard-Text");
         temperaturVerfuegbar = false;
@@ -929,15 +939,28 @@ void DHTTask(void *parameter) {
       } else {
         Serial.printf("Temperatur: %.2f °C\n", temperatur);
         
-        // Prüfen ob Update nötig ist
+        // Prüfen ob Update nötig ist - VERBESSERTE LOGIK
         bool statusGeaendert = !temperaturVerfuegbar;
-        bool temperaturGeaendert = temperaturVerfuegbar && (abs(aktuelleTemperatur - temperatur) > 0.1);
         
-        if (statusGeaendert || temperaturGeaendert) {
+        // Temperaturänderung prüfen: Nur bei signifikanter Änderung (>= 0.5°C)
+        bool temperaturSignifikantGeaendert = false;
+        if (temperaturVerfuegbar) {
+          float temperaturDifferenz = abs(letzteAngezeigeTemperatur - temperatur);
+          temperaturSignifikantGeaendert = (temperaturDifferenz >= 0.0); // Mindestens 0.0°C Unterschied
+          
+          Serial.printf("Temperatur-Vergleich: Aktuell %.1f°C, Angezeigt %.1f°C, Differenz %.1f°C\n", 
+                       temperatur, letzteAngezeigeTemperatur, temperaturDifferenz);
+        }
+        
+        if (statusGeaendert || temperaturSignifikantGeaendert) {
           aktuelleTemperatur = temperatur;
           temperaturVerfuegbar = true;
           neueTemperaturVerfuegbar = true; // Markiere dass Update nötig ist
-          Serial.println("Neue Temperatur verfügbar - wartet auf Scroll-Completion");
+          Serial.printf("Temperatur-Update erforderlich: Status geändert=%s, Temp. signifikant geändert=%s\n",
+                       statusGeaendert ? "ja" : "nein",
+                       temperaturSignifikantGeaendert ? "ja" : "nein");
+        } else {
+          Serial.println("Temperaturänderung zu gering - kein Display-Update");
         }
         
         // Sende Daten in separater Task um Blocking zu vermeiden
