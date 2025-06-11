@@ -21,7 +21,7 @@ TaskHandle_t MenuTaskHandle = NULL;
 EntprellterTaster taster(32, 34, 35);
 
 // DHT22 Sensor Setup
-#define DHTPIN 21
+#define DHTPIN 33
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -180,7 +180,7 @@ void updateScrollText() {
         break;
       case 2: // Task C (Uhrzeit)
         upperResetLimit = upperTextWidth + MATRIX_WIDTH-32;
-        lowerResetLimit = lowerTextWidth + MATRIX_WIDTH-30;
+        lowerResetLimit = lowerTextWidth + MATRIX_WIDTH-31;
         break;
       case 3: // DHTTask
         upperResetLimit = upperTextWidth + MATRIX_WIDTH-32;
